@@ -3188,7 +3188,10 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
           MakeReadbackResolveKey(written_address, written_length);
       ReadbackBuffer& rb = readback_buffers_[resolve_key];
       uint64_t readback_previous_use_frame = rb.last_used_frame;
-      rb.last_used_frame = frame_current_;
+      if (rb.last_used_frame != frame_current_) {
+        rb.prior_use_frame = rb.last_used_frame;
+        rb.last_used_frame = frame_current_;
+      }
 
       if (draw_resolution_scaled) {
         HandleScaledResolveReadback(readback_resolve_info, written_address,
@@ -3303,9 +3306,24 @@ void D3D12CommandProcessor::HandleScaledResolveReadback(
   // rarely consumed on the CPU, while a GPU-CPU sync and a CPU downsample for
   // each of them every frame is prohibitively expensive at scaled
   // resolutions.
-  if (readback_previous_use_frame != frame_current_ &&
-      readback_previous_use_frame + 3 >= frame_current_) {
-    return;
+  // Games consume small per-frame resolves (projected shadows, exposure) and
+  // render-to-texture bakes (which resolve multiple times within one frame)
+  // on the CPU - skipping those causes missing or stale texture data. Skip
+  // only steady-state resolves: the first resolve of a target per frame when
+  // it was also resolved within the last three frames (covers
+  // double/triple-buffered targets), and, for large full-screen surfaces
+  // whose repeated downsampling is too expensive, also repeats within a frame
+  // when the target is in per-frame use.
+  bool same_frame_repeat = readback_previous_use_frame == frame_current_;
+  if (!same_frame_repeat) {
+    if (readback_previous_use_frame + 3 >= frame_current_) {
+      return;
+    }
+  } else {
+    if (rb.prior_use_frame + 3 >= frame_current_ &&
+        IsReadbackResolveDeferred(written_length)) {
+      return;
+    }
   }
   // Stacked/3D destinations aren't supported by the CPU downsampler.
   if (resolve_info.copy_dest_info.copy_dest_array) {

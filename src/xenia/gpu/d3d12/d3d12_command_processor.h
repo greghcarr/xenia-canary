@@ -747,6 +747,10 @@ class D3D12CommandProcessor final : public CommandProcessor {
     uint32_t sizes[2] = {0, 0};
     uint32_t current_index = 0;
     uint64_t last_used_frame = 0;
+    // The most recent frame before last_used_frame in which this target was
+    // resolved - for steady-state detection that is not confused by multiple
+    // resolves to the target within a single frame.
+    uint64_t prior_use_frame = 0;
   };
   // Reads back a resolve performed with resolution scaling by copying the
   // scaled resolve data and reconstructing the unscaled guest memory contents
