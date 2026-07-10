@@ -297,7 +297,9 @@ X_STATUS Emulator::Setup(
   }
 
   // Add inputSystem to UI
-  imgui_drawer_->LoadInputSystem(input_system_.get());
+  if (imgui_drawer_) {
+    imgui_drawer_->LoadInputSystem(input_system_.get());
+  }
 
   XELOGI("{}: Initializing VFS...", __func__);
   // Bring up the virtual filesystem used by the kernel.
@@ -320,10 +322,14 @@ X_STATUS Emulator::Setup(
 
   XELOGI("{}: Starting graphics_system...", __func__);
   // Setup the core components.
-  result = graphics_system_->Setup(
-      processor_.get(), kernel_state_.get(),
-      display_window_ ? &display_window_->app_context() : nullptr,
-      display_window_ != nullptr);
+  // Presentation is requested even without a display window so headless
+  // consumers (trace dump) get the offscreen presenter needed for guest
+  // output capture.
+  result = graphics_system_->Setup(processor_.get(), kernel_state_.get(),
+                                   display_window_
+                                       ? &display_window_->app_context()
+                                       : nullptr,
+                                   true);
   if (result) {
     XELOGE("{}: Failed to setup graphics_system!", __func__);
     return result;
