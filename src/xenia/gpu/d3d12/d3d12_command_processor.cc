@@ -3294,13 +3294,17 @@ void D3D12CommandProcessor::HandleScaledResolveReadback(
     const draw_util::ResolveInfo& resolve_info, uint32_t written_address,
     uint32_t written_length, ReadbackBuffer& rb,
     uint64_t readback_previous_use_frame) {
-  // Only accurate synchronous readback is done for scaled resolves -
-  // steady-state per-frame resolves (the ones the delayed path exists for)
-  // keep the skip behavior they had before scaled readback support, as their
-  // results are rarely consumed on the CPU.
-  if (GetReadbackResolveMode() == ReadbackResolveMode::kFast &&
-      IsReadbackResolveDeferred(written_length) &&
-      readback_previous_use_frame + 1 == frame_current_) {
+  // Only accurate synchronous readback is done for scaled resolves, and only
+  // for non-steady-state ones (first use of a target, or multiple resolves to
+  // it within one frame, such as render-to-texture baking during loading).
+  // Steady-state resolves - up to triple-buffered targets used every third
+  // frame, regardless of size and of the readback mode - keep the skip
+  // behavior they had before scaled readback support: their results are
+  // rarely consumed on the CPU, while a GPU-CPU sync and a CPU downsample for
+  // each of them every frame is prohibitively expensive at scaled
+  // resolutions.
+  if (readback_previous_use_frame != frame_current_ &&
+      readback_previous_use_frame + 3 >= frame_current_) {
     return;
   }
   // Stacked/3D destinations aren't supported by the CPU downsampler.
