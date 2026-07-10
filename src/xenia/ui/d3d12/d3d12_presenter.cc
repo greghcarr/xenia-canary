@@ -29,6 +29,16 @@ DEFINE_bool(
     "cases.",
     "D3D12");
 
+DEFINE_bool(
+    d3d12_present_vsync, false,
+    "Synchronize host presentation with the display's vertical refresh "
+    "(swap chain sync interval 1) to eliminate screen tearing.\n"
+    "Only takes effect when d3d12_allow_variable_refresh_rate_and_tearing is "
+    "disabled. May add up to a frame of latency, and on displays whose "
+    "refresh rate is not a multiple of the guest frame rate, may cause "
+    "uneven frame pacing.",
+    "D3D12");
+
 namespace xe {
 namespace ui {
 namespace d3d12 {
@@ -1083,10 +1093,17 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
   // fullscreen is ever used in, the allow tearing flag must not be passed in
   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
   // presentation model used in Direct3D 12).
+  // DXGI_PRESENT_ALLOW_TEARING requires a sync interval of 0; host vsync is
+  // only available when tearing (variable refresh rate) is not requested.
+  UINT present_sync_interval =
+      (!paint_context_.swap_chain_allows_tearing && cvars::d3d12_present_vsync)
+          ? 1
+          : 0;
   HRESULT present_result = paint_context_.swap_chain->Present(
-      0, DXGI_PRESENT_RESTART | (paint_context_.swap_chain_allows_tearing
-                                     ? DXGI_PRESENT_ALLOW_TEARING
-                                     : 0));
+      present_sync_interval,
+      DXGI_PRESENT_RESTART | (paint_context_.swap_chain_allows_tearing
+                                  ? DXGI_PRESENT_ALLOW_TEARING
+                                  : 0));
   // Even if presentation has failed, work might have been enqueued anyway
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.
