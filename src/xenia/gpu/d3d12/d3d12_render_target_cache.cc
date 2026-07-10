@@ -1294,11 +1294,11 @@ void D3D12RenderTargetCache::WriteEdramUintPow2UAVDescriptor(
       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 }
 
-bool D3D12RenderTargetCache::Resolve(const Memory& memory,
-                                     D3D12SharedMemory& shared_memory,
-                                     D3D12TextureCache& texture_cache,
-                                     uint32_t& written_address_out,
-                                     uint32_t& written_length_out) {
+bool D3D12RenderTargetCache::Resolve(
+    const Memory& memory, D3D12SharedMemory& shared_memory,
+    D3D12TextureCache& texture_cache, uint32_t& written_address_out,
+    uint32_t& written_length_out,
+    draw_util::ResolveInfo* readback_resolve_info_out) {
   written_address_out = 0;
   written_length_out = 0;
 
@@ -1413,6 +1413,9 @@ bool D3D12RenderTargetCache::Resolve(const Memory& memory,
                                           resolve_info.copy_dest_extent_length);
         written_address_out = resolve_info.copy_dest_extent_start;
         written_length_out = resolve_info.copy_dest_extent_length;
+        if (readback_resolve_info_out) {
+          *readback_resolve_info_out = resolve_info;
+        }
         copied = true;
       } else {
         XELOGE(

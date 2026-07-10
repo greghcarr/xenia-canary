@@ -140,6 +140,11 @@ class D3D12TextureCache final : public TextureCache {
   // Returns the GPU address of the range specified in the last successful
   // MakeScaledResolveRangeCurrent call.
   D3D12_GPU_VIRTUAL_ADDRESS GetCurrentScaledResolveRangeGPUAddress() const;
+  // Returns the resource containing the current scaled resolve range (set by
+  // MakeScaledResolveRangeCurrent) and the offset of the range within it, for
+  // use as a copy source (such as for readback).
+  ID3D12Resource* GetCurrentScaledResolveRangeResource(
+      uint64_t& offset_bytes_out) const;
   void TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATES new_state);
   void MarkCurrentScaledResolveRangeUAVWritesCommitNeeded() {
     assert_true(IsDrawResolutionScaled());
