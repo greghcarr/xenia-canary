@@ -3314,16 +3314,9 @@ void D3D12CommandProcessor::HandleScaledResolveReadback(
   // double/triple-buffered targets), and, for large full-screen surfaces
   // whose repeated downsampling is too expensive, also repeats within a frame
   // when the target is in per-frame use.
-  bool same_frame_repeat = readback_previous_use_frame == frame_current_;
-  if (!same_frame_repeat) {
-    if (readback_previous_use_frame + 3 >= frame_current_) {
-      return;
-    }
-  } else {
-    if (rb.prior_use_frame + 3 >= frame_current_ &&
-        IsReadbackResolveDeferred(written_length)) {
-      return;
-    }
+  if (readback_previous_use_frame != frame_current_ &&
+      readback_previous_use_frame + 3 >= frame_current_) {
+    return;
   }
   // Stacked/3D destinations aren't supported by the CPU downsampler.
   if (resolve_info.copy_dest_info.copy_dest_array) {
