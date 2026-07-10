@@ -1183,6 +1183,18 @@ D3D12TextureCache::GetCurrentScaledResolveRangeGPUAddress() const {
           (uint64_t(buffer_index) << 30));
 }
 
+ID3D12Resource* D3D12TextureCache::GetCurrentScaledResolveRangeResource(
+    uint64_t& offset_bytes_out) const {
+  assert_true(IsDrawResolutionScaled());
+  const size_t buffer_index = GetCurrentScaledResolveBufferIndex();
+  const ScaledResolveVirtualBuffer* buffer =
+      scaled_resolve_2gb_buffers_[buffer_index].get();
+  assert_not_null(buffer);
+  offset_bytes_out = scaled_resolve_current_range_start_scaled_ -
+                     (uint64_t(buffer_index) << 30);
+  return buffer->resource();
+}
+
 ID3D12Resource* D3D12TextureCache::RequestSwapTexture(
     D3D12_SHADER_RESOURCE_VIEW_DESC& srv_desc_out,
     xenos::TextureFormat& format_out) {

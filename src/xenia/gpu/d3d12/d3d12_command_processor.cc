@@ -20,6 +20,8 @@
 #include "xenia/gpu/d3d12/d3d12_graphics_system.h"
 #include "xenia/gpu/d3d12/d3d12_shader.h"
 #include "xenia/gpu/draw_util.h"
+#include "xenia/gpu/texture_address.h"
+#include "xenia/gpu/texture_info.h"
 #include "xenia/gpu/gpu_flags.h"
 #include "xenia/gpu/packet_disassembler.h"
 #include "xenia/gpu/registers.h"
@@ -3069,12 +3071,138 @@ bool D3D12CommandProcessor::IssueCopy() {
     return IssueCopy_ReadbackResolvePath();
   }
 }
+namespace {
+// CPU-side reconstruction of unscaled guest texture data from
+// resolution-scaled resolve output. See texture_address.xesli for the scaled
+// addressing scheme: the tiled address of a guest group of blocks is
+// multiplied by the total scale factor, host groups are stored column-major
+// within a guest group, and blocks in a host group are linear row-major. Each
+// guest block is point-sampled from the top-left host block corresponding to
+// it.
+void DownsampleScaledResolveToGuest(const draw_util::ResolveInfo& resolve_info,
+                                    const uint8_t* scaled_range,
+                                    uint32_t range_address,
+                                    uint32_t range_length,
+                                    uint8_t* guest_range) {
+  const FormatInfo& dest_format_info = *FormatInfo::Get(
+      xenos::TextureFormat(resolve_info.copy_dest_info.copy_dest_format));
+  uint32_t bpb_log2 = xe::log2_floor(dest_format_info.bits_per_pixel >> 3);
+  uint32_t bpb = uint32_t(1) << bpb_log2;
+  uint32_t scale_x = resolve_info.coordinate_info.draw_resolution_scale_x;
+  uint32_t scale_y = resolve_info.coordinate_info.draw_resolution_scale_y;
+  uint32_t scale_total = scale_x * scale_y;
+  uint32_t pitch_blocks =
+      resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32
+      << xenos::kTextureTileWidthHeightLog2;
+  uint32_t x0 = resolve_info.copy_dest_coordinate_info.offset_x_div_8 << 3;
+  uint32_t y0 = resolve_info.copy_dest_coordinate_info.offset_y_div_8 << 3;
+  uint32_t width = resolve_info.coordinate_info.width_div_8 << 3;
+  uint32_t height = resolve_info.height_div_8 << 3;
+  uint32_t dest_base = resolve_info.copy_dest_base;
+  uint64_t scaled_range_base = uint64_t(range_address) * scale_total;
+  uint64_t scaled_range_length = uint64_t(range_length) * scale_total;
+  // Group dimensions in blocks - mirrors
+  // XeniaTextureResolutionScaledGroupBlocksLog2.
+  uint32_t group_blocks_x_log2 = bpb_log2 >= 3 ? 5 - bpb_log2 : 4;
+  uint32_t group_blocks_y_log2 = 3 - std::min(bpb_log2, uint32_t(2));
+  uint32_t group_width_bytes_log2 = group_blocks_x_log2 + bpb_log2;
+  uint32_t group_blocks_x = uint32_t(1) << group_blocks_x_log2;
+  uint32_t group_blocks_y = uint32_t(1) << group_blocks_y_log2;
+  uint32_t group_bytes = uint32_t(1)
+                         << (group_width_bytes_log2 + group_blocks_y_log2);
+
+  // Intra-group offsets are position-independent for group-aligned origins
+  // (all intra-group address bits are below the bits involved in tiling of
+  // whole groups) - precompute them once per group-local block position.
+  // - Guest: the tiled offset of the block relative to the group start.
+  // - Host (scaled): the byte offset of the block's top-left host block
+  //   within the scaled group, per the scaled addressing scheme.
+  uint32_t guest_intra[8][16];
+  uint32_t host_intra[8][16];
+  uint32_t align_x0 = x0 & ~(group_blocks_x - 1);
+  uint32_t align_y0 = y0 & ~(group_blocks_y - 1);
+  uint32_t group_tiled_origin = uint32_t(texture_address::Tiled2D(
+      int32_t(align_x0), int32_t(align_y0), pitch_blocks, bpb_log2));
+  for (uint32_t ly = 0; ly < group_blocks_y; ++ly) {
+    for (uint32_t lx = 0; lx < group_blocks_x; ++lx) {
+      guest_intra[ly][lx] =
+          uint32_t(texture_address::Tiled2D(int32_t(align_x0 + lx),
+                                            int32_t(align_y0 + ly),
+                                            pitch_blocks, bpb_log2)) -
+          group_tiled_origin;
+      uint32_t host_x = lx * scale_x;
+      uint32_t host_y = ly * scale_y;
+      uint32_t host_group_index = (host_x >> group_blocks_x_log2) * scale_y +
+                                  (host_y >> group_blocks_y_log2);
+      host_intra[ly][lx] =
+          (host_group_index << (group_width_bytes_log2 + group_blocks_y_log2)) |
+          ((host_y & (group_blocks_y - 1)) << group_width_bytes_log2) |
+          ((host_x & (group_blocks_x - 1)) << bpb_log2);
+    }
+  }
+
+  for (uint32_t group_y = align_y0; group_y < y0 + height;
+       group_y += group_blocks_y) {
+    uint32_t ly_begin = std::max(group_y, y0) - group_y;
+    uint32_t ly_end = std::min(group_y + group_blocks_y, y0 + height) - group_y;
+    for (uint32_t group_x = align_x0; group_x < x0 + width;
+         group_x += group_blocks_x) {
+      uint32_t lx_begin = std::max(group_x, x0) - group_x;
+      uint32_t lx_end =
+          std::min(group_x + group_blocks_x, x0 + width) - group_x;
+      uint32_t group_tiled = uint32_t(texture_address::Tiled2D(
+          int32_t(group_x), int32_t(group_y), pitch_blocks, bpb_log2));
+      int64_t dst_group_base =
+          int64_t(dest_base) + group_tiled - range_address;
+      int64_t src_group_base =
+          (int64_t(dest_base) + group_tiled) * scale_total -
+          int64_t(scaled_range_base);
+      if (lx_begin == 0 && ly_begin == 0 && lx_end == group_blocks_x &&
+          ly_end == group_blocks_y && dst_group_base >= 0 &&
+          uint64_t(dst_group_base) + group_bytes <= range_length &&
+          src_group_base >= 0 &&
+          uint64_t(src_group_base) + uint64_t(group_bytes) * scale_total <=
+              scaled_range_length) {
+        // Whole group inside the rectangle and the written range.
+        for (uint32_t ly = 0; ly < group_blocks_y; ++ly) {
+          for (uint32_t lx = 0; lx < group_blocks_x; ++lx) {
+            std::memcpy(
+                guest_range + size_t(dst_group_base) + guest_intra[ly][lx],
+                scaled_range + size_t(src_group_base) + host_intra[ly][lx],
+                bpb);
+          }
+        }
+      } else {
+        for (uint32_t ly = ly_begin; ly < ly_end; ++ly) {
+          for (uint32_t lx = lx_begin; lx < lx_end; ++lx) {
+            int64_t dst_offset = dst_group_base + guest_intra[ly][lx];
+            int64_t src_offset = src_group_base + host_intra[ly][lx];
+            if (dst_offset < 0 ||
+                uint64_t(dst_offset) + bpb > range_length ||
+                src_offset < 0 ||
+                uint64_t(src_offset) + bpb > scaled_range_length) {
+              continue;
+            }
+            std::memcpy(guest_range + size_t(dst_offset),
+                        scaled_range + size_t(src_offset), bpb);
+          }
+        }
+      }
+    }
+  }
+}
+}  // namespace
+
 XE_NOINLINE
 bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   uint32_t written_address, written_length;
-  if (render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                    written_address, written_length)) {
-    if (!texture_cache_->IsDrawResolutionScaled() && written_length) {
+  bool draw_resolution_scaled = texture_cache_->IsDrawResolutionScaled();
+  draw_util::ResolveInfo readback_resolve_info;
+  if (render_target_cache_->Resolve(
+          *memory_, *shared_memory_, *texture_cache_, written_address,
+          written_length,
+          draw_resolution_scaled ? &readback_resolve_info : nullptr)) {
+    if (written_length) {
       // Early check: if destination memory is not accessible, skip all the
       // expensive GPU readback work.
       VirtualHeap* physical_heap = memory_->GetPhysicalHeap();
@@ -3103,7 +3231,17 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
           MakeReadbackResolveKey(written_address, written_length);
       ReadbackBuffer& rb = readback_buffers_[resolve_key];
       uint64_t readback_previous_use_frame = rb.last_used_frame;
-      rb.last_used_frame = frame_current_;
+      if (rb.last_used_frame != frame_current_) {
+        rb.prior_use_frame = rb.last_used_frame;
+        rb.last_used_frame = frame_current_;
+      }
+
+      if (draw_resolution_scaled) {
+        HandleScaledResolveReadback(readback_resolve_info, written_address,
+                                    written_length, rb,
+                                    readback_previous_use_frame);
+        return true;
+      }
 
       uint32_t write_index = rb.current_index;
       uint32_t size = AlignReadbackBufferSize(written_length);
@@ -3196,6 +3334,107 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     return false;
   }
   return true;
+}
+
+void D3D12CommandProcessor::HandleScaledResolveReadback(
+    const draw_util::ResolveInfo& resolve_info, uint32_t written_address,
+    uint32_t written_length, ReadbackBuffer& rb,
+    uint64_t readback_previous_use_frame) {
+  // Only accurate synchronous readback is done for scaled resolves, and only
+  // for non-steady-state ones (first use of a target, or multiple resolves to
+  // it within one frame, such as render-to-texture baking during loading).
+  // Steady-state resolves - up to triple-buffered targets used every third
+  // frame, regardless of size and of the readback mode - keep the skip
+  // behavior they had before scaled readback support: their results are
+  // rarely consumed on the CPU, while a GPU-CPU sync and a CPU downsample for
+  // each of them every frame is prohibitively expensive at scaled
+  // resolutions.
+  // Games consume small per-frame resolves (projected shadows, exposure) and
+  // render-to-texture bakes (which resolve multiple times within one frame)
+  // on the CPU - skipping those causes missing or stale texture data. Skip
+  // only steady-state resolves: the first resolve of a target per frame when
+  // it was also resolved within the last three frames (covers
+  // double/triple-buffered targets), and, for large full-screen surfaces
+  // whose repeated downsampling is too expensive, also repeats within a frame
+  // when the target is in per-frame use.
+  if (readback_previous_use_frame != frame_current_ &&
+      readback_previous_use_frame + 3 >= frame_current_) {
+    return;
+  }
+  // Stacked/3D destinations aren't supported by the CPU downsampler.
+  if (resolve_info.copy_dest_info.copy_dest_array) {
+    return;
+  }
+  if (resolve_info.copy_dest_extent_start != written_address ||
+      resolve_info.copy_dest_extent_length != written_length) {
+    return;
+  }
+  uint32_t scale_x = resolve_info.coordinate_info.draw_resolution_scale_x;
+  uint32_t scale_y = resolve_info.coordinate_info.draw_resolution_scale_y;
+  uint64_t scaled_length = uint64_t(written_length) * scale_x * scale_y;
+  if (!scaled_length || scaled_length > UINT32_MAX) {
+    return;
+  }
+
+  uint32_t write_index = rb.current_index;
+  uint32_t size = AlignReadbackBufferSize(uint32_t(scaled_length));
+  if (size > rb.sizes[write_index]) {
+    const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+    ID3D12Device* device = provider.GetDevice();
+    D3D12_RESOURCE_DESC buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(buffer_desc, size,
+                                            D3D12_RESOURCE_FLAG_NONE);
+    ID3D12Resource* buffer;
+    if (SUCCEEDED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesReadback,
+            provider.GetHeapFlagCreateNotZeroed(), &buffer_desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&buffer)))) {
+      if (rb.buffers[write_index] != nullptr) {
+        rb.buffers[write_index]->Release();
+      }
+      rb.buffers[write_index] = buffer;
+      rb.sizes[write_index] = size;
+    } else {
+      XELOGE("Failed to create a {} MB scaled readback buffer", size >> 20);
+      return;
+    }
+  }
+
+  // Copy the scaled resolve data to the readback buffer.
+  if (!texture_cache_->MakeScaledResolveRangeCurrent(written_address,
+                                                     written_length)) {
+    return;
+  }
+  texture_cache_->TransitionCurrentScaledResolveRange(
+      D3D12_RESOURCE_STATE_COPY_SOURCE);
+  SubmitBarriers();
+  uint64_t scaled_source_offset;
+  ID3D12Resource* scaled_source =
+      texture_cache_->GetCurrentScaledResolveRangeResource(
+          scaled_source_offset);
+  deferred_command_list_.D3DCopyBufferRegion(rb.buffers[write_index], 0,
+                                             scaled_source,
+                                             scaled_source_offset,
+                                             scaled_length);
+
+  // Wait for the GPU and reconstruct the unscaled guest memory contents.
+  if (!AwaitAllQueueOperationsCompletion()) {
+    return;
+  }
+  D3D12_RANGE readback_range;
+  readback_range.Begin = 0;
+  readback_range.End = size_t(scaled_length);
+  void* readback_mapping;
+  if (SUCCEEDED(rb.buffers[write_index]->Map(0, &readback_range,
+                                             &readback_mapping))) {
+    DownsampleScaledResolveToGuest(
+        resolve_info, reinterpret_cast<const uint8_t*>(readback_mapping),
+        written_address, written_length,
+        memory_->TranslatePhysical(written_address));
+    D3D12_RANGE readback_write_range = {};
+    rb.buffers[write_index]->Unmap(0, &readback_write_range);
+  }
+  rb.current_index = 1 - write_index;
 }
 
 void D3D12CommandProcessor::CheckSubmissionCompletion(

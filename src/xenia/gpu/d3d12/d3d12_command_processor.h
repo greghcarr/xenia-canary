@@ -747,7 +747,19 @@ class D3D12CommandProcessor final : public CommandProcessor {
     uint32_t sizes[2] = {0, 0};
     uint32_t current_index = 0;
     uint64_t last_used_frame = 0;
+    // The most recent frame before last_used_frame in which this target was
+    // resolved - for steady-state detection that is not confused by multiple
+    // resolves to the target within a single frame.
+    uint64_t prior_use_frame = 0;
   };
+  // Reads back a resolve performed with resolution scaling by copying the
+  // scaled resolve data and reconstructing the unscaled guest memory contents
+  // on the CPU. Always synchronous; steady-state per-frame resolves are
+  // skipped like they were before scaled readback support.
+  void HandleScaledResolveReadback(const draw_util::ResolveInfo& resolve_info,
+                                   uint32_t written_address,
+                                   uint32_t written_length, ReadbackBuffer& rb,
+                                   uint64_t readback_previous_use_frame);
   // Map: (written_address << 32 | written_length) -> ReadbackBuffer
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
 
