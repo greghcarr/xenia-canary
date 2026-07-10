@@ -13,6 +13,7 @@
 #include "xenia/base/logging.h"
 #include "xenia/base/math.h"
 
+#include "xenia/vfs/devices/disc_image_device.h"
 #include "xenia/vfs/devices/xcontent_container_device.h"
 #include "xenia/vfs/file.h"
 #include "xenia/vfs/virtual_file_system.h"
@@ -35,6 +36,10 @@ int vfs_dump_main(const std::vector<std::string>& args) {
   std::filesystem::path base_path = cvars::dump_path;
   std::unique_ptr<vfs::Device> device =
       vfs::XContentContainerDevice::CreateContentDevice("", cvars::source);
+  if (!device) {
+    // Not an XContent package - try mounting as a disc image (ISO/XISO).
+    device = std::make_unique<vfs::DiscImageDevice>("", cvars::source);
+  }
 
   if (!device->Initialize()) {
     XELOGE("Failed to initialize device");
