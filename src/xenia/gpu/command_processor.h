@@ -55,6 +55,10 @@ void SaveGPUSetting(GPUSetting setting, uint64_t value);
 bool GetGPUSetting(GPUSetting setting);
 ReadbackResolveMode GetReadbackResolveMode();
 void SetReadbackResolveMode(const std::string& mode);
+// Whether a resolve of this size should use the one-frame-delayed readback
+// path in the "fast" mode rather than an accurate synchronous readback (small
+// resolves are typically render-to-texture targets consumed on the CPU).
+bool IsReadbackResolveDeferred(uint32_t resolve_length_bytes);
 ZPDMode GetZPDMode();
 void SetZPDMode(const std::string& mode);
 

@@ -3102,6 +3102,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
       uint64_t resolve_key =
           MakeReadbackResolveKey(written_address, written_length);
       ReadbackBuffer& rb = readback_buffers_[resolve_key];
+      uint64_t readback_previous_use_frame = rb.last_used_frame;
       rb.last_used_frame = frame_current_;
 
       uint32_t write_index = rb.current_index;
@@ -3140,7 +3141,15 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
           written_length);
 
       ReadbackResolveMode readback_mode = GetReadbackResolveMode();
-      bool use_delayed_sync = (readback_mode == ReadbackResolveMode::kFast);
+      // Defer the readback only for steady-state per-frame surfaces (also
+      // resolved in the previous frame). Targets resolved sporadically or
+      // multiple times within one frame (render-to-texture baking during
+      // loading) are read back accurately - they are exactly the resolves
+      // whose results games consume on the CPU.
+      bool use_delayed_sync =
+          readback_mode == ReadbackResolveMode::kFast &&
+          IsReadbackResolveDeferred(written_length) &&
+          readback_previous_use_frame + 1 == frame_current_;
       uint32_t read_index = write_index;
 
       if (use_delayed_sync) {

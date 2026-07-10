@@ -77,6 +77,17 @@ DEFINE_string(
 
 UPDATE_from_string(readback_resolve, 2025, 12, 4, 21, "fast");
 
+DEFINE_uint32(
+    readback_resolve_fast_sync_size, 0x200000,
+    "In the \"fast\" readback_resolve mode, resolves of up to this many bytes "
+    "are still read back synchronously with a GPU wait, since small "
+    "render-to-texture targets are what games typically consume on the CPU "
+    "(such as texture baking during loading), while large full-screen "
+    "resolves are deferred by one frame to avoid a GPU-CPU stall every "
+    "frame.\n"
+    "0 = defer all resolves (previous \"fast\" behavior).",
+    "GPU");
+
 DEFINE_bool(
     readback_memexport, false,
     "Read data written by memory export in shaders on the CPU. "
@@ -125,6 +136,10 @@ ReadbackResolveMode GetReadbackResolveMode() {
 
 void SetReadbackResolveMode(const std::string& mode) {
   OVERRIDE_string(readback_resolve, mode);
+}
+
+bool IsReadbackResolveDeferred(uint32_t resolve_length_bytes) {
+  return resolve_length_bytes > cvars::readback_resolve_fast_sync_size;
 }
 
 ZPDMode GetZPDMode() {
