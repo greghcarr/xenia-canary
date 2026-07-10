@@ -9,7 +9,10 @@ virtual uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index)
 virtual bool ExecutePacket() PM4_OVERRIDE;
 
 public:
-void ExecutePacket(uint32_t ptr, uint32_t count);
+// Virtual so external callers holding a base CommandProcessor* (such as the
+// trace player) reach the backend's devirtualized PM4 chain instead of the
+// base instantiation, whose statically bound IssueDraw/IssueSwap are stubs.
+virtual void ExecutePacket(uint32_t ptr, uint32_t count) PM4_OVERRIDE;
 
 protected:
 XE_NOINLINE
