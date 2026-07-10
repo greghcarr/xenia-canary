@@ -3106,45 +3106,88 @@ void DownsampleScaledResolveToGuest(const draw_util::ResolveInfo& resolve_info,
   uint32_t group_blocks_x_log2 = bpb_log2 >= 3 ? 5 - bpb_log2 : 4;
   uint32_t group_blocks_y_log2 = 3 - std::min(bpb_log2, uint32_t(2));
   uint32_t group_width_bytes_log2 = group_blocks_x_log2 + bpb_log2;
-  for (uint32_t block_y = y0; block_y < y0 + height; ++block_y) {
-    for (uint32_t block_x = x0; block_x < x0 + width; ++block_x) {
-      uint32_t dst_address =
-          dest_base +
-          uint32_t(texture_address::Tiled2D(int32_t(block_x), int32_t(block_y),
-                                            pitch_blocks, bpb_log2));
-      if (dst_address < range_address ||
-          uint64_t(dst_address) + bpb > uint64_t(range_address) + range_length) {
-        continue;
+  uint32_t group_blocks_x = uint32_t(1) << group_blocks_x_log2;
+  uint32_t group_blocks_y = uint32_t(1) << group_blocks_y_log2;
+  uint32_t group_bytes = uint32_t(1)
+                         << (group_width_bytes_log2 + group_blocks_y_log2);
+
+  // Intra-group offsets are position-independent for group-aligned origins
+  // (all intra-group address bits are below the bits involved in tiling of
+  // whole groups) - precompute them once per group-local block position.
+  // - Guest: the tiled offset of the block relative to the group start.
+  // - Host (scaled): the byte offset of the block's top-left host block
+  //   within the scaled group, per the scaled addressing scheme.
+  uint32_t guest_intra[8][16];
+  uint32_t host_intra[8][16];
+  uint32_t align_x0 = x0 & ~(group_blocks_x - 1);
+  uint32_t align_y0 = y0 & ~(group_blocks_y - 1);
+  uint32_t group_tiled_origin = uint32_t(texture_address::Tiled2D(
+      int32_t(align_x0), int32_t(align_y0), pitch_blocks, bpb_log2));
+  for (uint32_t ly = 0; ly < group_blocks_y; ++ly) {
+    for (uint32_t lx = 0; lx < group_blocks_x; ++lx) {
+      guest_intra[ly][lx] =
+          uint32_t(texture_address::Tiled2D(int32_t(align_x0 + lx),
+                                            int32_t(align_y0 + ly),
+                                            pitch_blocks, bpb_log2)) -
+          group_tiled_origin;
+      uint32_t host_x = lx * scale_x;
+      uint32_t host_y = ly * scale_y;
+      uint32_t host_group_index = (host_x >> group_blocks_x_log2) * scale_y +
+                                  (host_y >> group_blocks_y_log2);
+      host_intra[ly][lx] =
+          (host_group_index << (group_width_bytes_log2 + group_blocks_y_log2)) |
+          ((host_y & (group_blocks_y - 1)) << group_width_bytes_log2) |
+          ((host_x & (group_blocks_x - 1)) << bpb_log2);
+    }
+  }
+
+  for (uint32_t group_y = align_y0; group_y < y0 + height;
+       group_y += group_blocks_y) {
+    uint32_t ly_begin = std::max(group_y, y0) - group_y;
+    uint32_t ly_end = std::min(group_y + group_blocks_y, y0 + height) - group_y;
+    for (uint32_t group_x = align_x0; group_x < x0 + width;
+         group_x += group_blocks_x) {
+      uint32_t lx_begin = std::max(group_x, x0) - group_x;
+      uint32_t lx_end =
+          std::min(group_x + group_blocks_x, x0 + width) - group_x;
+      uint32_t group_tiled = uint32_t(texture_address::Tiled2D(
+          int32_t(group_x), int32_t(group_y), pitch_blocks, bpb_log2));
+      int64_t dst_group_base =
+          int64_t(dest_base) + group_tiled - range_address;
+      int64_t src_group_base =
+          (int64_t(dest_base) + group_tiled) * scale_total -
+          int64_t(scaled_range_base);
+      if (lx_begin == 0 && ly_begin == 0 && lx_end == group_blocks_x &&
+          ly_end == group_blocks_y && dst_group_base >= 0 &&
+          uint64_t(dst_group_base) + group_bytes <= range_length &&
+          src_group_base >= 0 &&
+          uint64_t(src_group_base) + uint64_t(group_bytes) * scale_total <=
+              scaled_range_length) {
+        // Whole group inside the rectangle and the written range.
+        for (uint32_t ly = 0; ly < group_blocks_y; ++ly) {
+          for (uint32_t lx = 0; lx < group_blocks_x; ++lx) {
+            std::memcpy(
+                guest_range + size_t(dst_group_base) + guest_intra[ly][lx],
+                scaled_range + size_t(src_group_base) + host_intra[ly][lx],
+                bpb);
+          }
+        }
+      } else {
+        for (uint32_t ly = ly_begin; ly < ly_end; ++ly) {
+          for (uint32_t lx = lx_begin; lx < lx_end; ++lx) {
+            int64_t dst_offset = dst_group_base + guest_intra[ly][lx];
+            int64_t src_offset = src_group_base + host_intra[ly][lx];
+            if (dst_offset < 0 ||
+                uint64_t(dst_offset) + bpb > range_length ||
+                src_offset < 0 ||
+                uint64_t(src_offset) + bpb > scaled_range_length) {
+              continue;
+            }
+            std::memcpy(guest_range + size_t(dst_offset),
+                        scaled_range + size_t(src_offset), bpb);
+          }
+        }
       }
-      // Top-left host block of this guest block in the scaled layout.
-      uint32_t host_x = block_x * scale_x;
-      uint32_t host_y = block_y * scale_y;
-      uint32_t host_group_x = host_x >> group_blocks_x_log2;
-      uint32_t host_group_y = host_y >> group_blocks_y_log2;
-      uint32_t guest_group_x = host_group_x / scale_x;
-      uint32_t guest_group_y = host_group_y / scale_y;
-      uint32_t host_group_index =
-          (host_group_x - scale_x * guest_group_x) * scale_y +
-          (host_group_y - scale_y * guest_group_y);
-      uint32_t host_byte_offset =
-          (host_group_index
-           << (group_width_bytes_log2 + group_blocks_y_log2)) |
-          ((host_y & ((uint32_t(1) << group_blocks_y_log2) - 1))
-           << group_width_bytes_log2) |
-          ((host_x & ((uint32_t(1) << group_blocks_x_log2) - 1)) << bpb_log2);
-      uint64_t src_offset =
-          (uint64_t(dest_base) +
-           uint64_t(uint32_t(texture_address::Tiled2D(
-               int32_t(guest_group_x << group_blocks_x_log2),
-               int32_t(guest_group_y << group_blocks_y_log2), pitch_blocks,
-               bpb_log2)))) *
-              scale_total +
-          host_byte_offset - scaled_range_base;
-      if (src_offset + bpb > scaled_range_length) {
-        continue;
-      }
-      std::memcpy(guest_range + (dst_address - range_address),
-                  scaled_range + src_offset, bpb);
     }
   }
 }
