@@ -3352,13 +3352,18 @@ void D3D12CommandProcessor::HandleScaledResolveReadback(
   // Games consume small per-frame resolves (projected shadows, exposure) and
   // render-to-texture bakes (which resolve multiple times within one frame)
   // on the CPU - skipping those causes missing or stale texture data. Skip
-  // only steady-state resolves: the first resolve of a target per frame when
-  // it was also resolved within the last three frames (covers
-  // double/triple-buffered targets), and, for large full-screen surfaces
-  // whose repeated downsampling is too expensive, also repeats within a frame
-  // when the target is in per-frame use.
+  // only LARGE steady-state resolves: the first resolve of a full-screen
+  // target per frame when it was also resolved within the last three frames
+  // (covers double/triple-buffered surfaces), whose repeated per-frame
+  // downsampling dominates frame time. Small steady-state resolves are read
+  // back accurately even in per-frame use - these are cheap to downsample and
+  // are consumed on the CPU (auto-exposure luminance, projected shadows), so
+  // skipping them breaks time-of-day exposure and similar effects. This
+  // matches the unscaled ("fast") readback path, which always syncs small
+  // resolves.
   if (readback_previous_use_frame != frame_current_ &&
-      readback_previous_use_frame + 3 >= frame_current_) {
+      readback_previous_use_frame + 3 >= frame_current_ &&
+      IsReadbackResolveDeferred(written_length)) {
     return;
   }
   // Stacked/3D destinations aren't supported by the CPU downsampler.
